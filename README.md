@@ -22,7 +22,7 @@ resume-parser/
 │   ├── main.py           # FastAPI app (routes + auth)
 │   ├── parser.py         # text extraction + AI calls (resume parsing, JD extraction, match reasoning)
 │   ├── scoring.py        # deterministic hiring-score math (skill match %, experience/education fit)
-│   ├── db.py             # MongoDB storage (resumes + users + job descriptions)
+│   ├── db.py             # MongoDB storage (resumes + users + job descriptions + interview sessions + pipeline)
 │   ├── requirements.txt
 │   └── .env.example
 └── frontend/
@@ -136,6 +136,31 @@ manual schema setup needed.
 - **Candidate notes**: jot down your own comments on any candidate from
   their dossier view (interview impressions, follow-ups, etc.) and save them
   alongside the parsed data in MongoDB.
+- **Interview Prep tab (Role-Specific Interview Question Generation)**: pick
+  a candidate and a job (saved or ad-hoc), and the AI generates a question
+  set grounded in that specific job's requirements and that specific
+  candidate's resume — technical questions, behavioral/situational
+  questions (each tagged Beginner/Intermediate/Advanced), and resume-targeted
+  follow-up questions.
+- **AI-Powered Interview Simulation**: run the generated questions as a
+  simulated interview — **type or record a voice answer** to each question
+  (voice is transcribed locally with Whisper, no API key, before scoring) and
+  the AI immediately scores it for **relevance**, **communication**, and
+  **confidence** (0–100 each), with specific feedback, strengths, and
+  improvement suggestions per answer. Completing the interview aggregates
+  every answered question into one **interview performance report**: an
+  overall score, per-dimension averages, a plain-language verdict, and
+  pooled strengths/improvements — downloadable as a Markdown report. Past
+  sessions are saved and can be reopened anytime, and a summary (session
+  count, average score, most recent sessions) also appears on the
+  **Dashboard tab**.
+- **Pipeline tab (ATS Integration)**: track every candidate through
+  recruitment stages — **Applied → Screening → Interview → Selected →
+  Rejected** — per job. A kanban-style board shows headcount per stage at a
+  glance; below it, add/update a candidate's stage, interview date/time, and
+  recruiter feedback — filterable by job, by stage, and searchable by
+  candidate name. A per-stage headcount chart also appears on the
+  **Dashboard tab**.
 
 ### How the Hiring Score is calculated
 
@@ -173,6 +198,18 @@ candidates aren't penalized for a requirement that was never stated.
 | GET    | `/jobs/{id}`            | Full record for one Job Description 🔒 |
 | DELETE | `/jobs/{id}`            | Remove a saved Job Description 🔒      |
 | POST   | `/match`                | Score candidate(s) vs. a job (body: `{"job_id": optional, "job_description": optional, "resume_id": optional}` — provide `job_id` for a saved job or `job_description` for ad-hoc text; omit `resume_id` to score everyone). Returns `{"job_title", "required_skills", "min_years_experience", "required_education", "results": [{"id", "name", "hiring_score", "skill_match_pct", "skill_gap_pct", "matched_skills", "missing_skills", "additional_skills", "experience_score", "education_score", "ai_score", "reasoning", "recommendations"}], ...}`, ranked descending by `hiring_score` 🔒 |
+| POST   | `/interview/generate`  | Generate a role-specific + candidate-specific interview question set (body: `{"resume_id", "job_id": optional, "job_description": optional}`). Creates and returns a new interview session with `technical`/`behavioral`/`follow_up` questions, each tagged with a difficulty 🔒 |
+| GET    | `/interview/sessions`  | List all interview sessions (summary: candidate, job, status, overall score if completed) 🔒 |
+| GET    | `/interview/sessions/{id}` | Full session: questions, answers so far, evaluations so far 🔒 |
+| POST   | `/interview/sessions/{id}/answer` | Submit and evaluate one **text** answer (body: `{"question_id", "answer"}`) → returns `{"relevance_score", "communication_score", "confidence_score", "feedback", "strengths", "improvements"}` 🔒 |
+| POST   | `/interview/sessions/{id}/answer-audio` | Submit one **voice** answer (multipart: `question_id` field + `file` audio upload) — transcribed locally with Whisper, then scored exactly like a text answer. Returns `{"transcript", ...same evaluation fields as above}` 🔒 |
+| POST   | `/interview/sessions/{id}/complete` | Aggregate all answered questions into a final interview performance report and mark the session completed 🔒 |
+| DELETE | `/interview/sessions/{id}` | Remove an interview session 🔒 |
+| POST   | `/pipeline`             | Create or update a candidate's stage for a job (body: `{"resume_id", "job_id", "status"?, "interview_datetime"?, "recruiter_feedback"?}`) 🔒 |
+| GET    | `/pipeline`             | List pipeline entries (optional `?job_id=` and `?status=` filters) 🔒 |
+| PATCH  | `/pipeline/{id}`        | Update a pipeline entry's stage/schedule/feedback 🔒 |
+| DELETE | `/pipeline/{id}`        | Remove a pipeline entry 🔒 |
+| GET    | `/pipeline/stages`      | The fixed list of valid stages (`Applied`, `Screening`, `Interview`, `Selected`, `Rejected`) |
 | GET    | `/health`               | Health check                          |
 
 🔒 = requires an `Authorization: Bearer <token>` header from `/auth/login` or `/auth/signup`.
@@ -214,8 +251,15 @@ API_BASE=http://localhost:8000 streamlit run app.py
 7. Use the **Job Descriptions** tab to save postings for reuse (AI fills in
    any requirements you don't specify), then the **Match Job** tab to pick a
    saved job or paste one ad-hoc and rank every candidate by Hiring Score,
-   with a full skill-gap breakdown and downloadable reports. Use the
-   **Dashboard** tab for pipeline-wide stats.
+   with a full skill-gap breakdown and downloadable reports.
+8. Use the **Interview Prep** tab to generate role-specific interview
+   questions for a candidate + job, run them as a simulated interview with
+   live AI-scored feedback per answer, and generate a downloadable
+   performance report.
+9. Use the **Pipeline** tab to move candidates through recruitment stages
+   (Applied → Screening → Interview → Selected → Rejected) per job, with a
+   kanban-style overview and per-candidate interview scheduling/feedback.
+10. Use the **Dashboard** tab for pipeline-wide stats.
 
 ## Notes & next steps
 
@@ -251,3 +295,11 @@ API_BASE=http://localhost:8000 streamlit run app.py
   fine for dozens, slow for hundreds. Each score is computed fresh (not
   cached), so re-running against a different job description always
   reflects the new text.
+- **Voice answers**: recorded with `st.audio_input` (mic capture right in the
+  browser) and transcribed locally by `faster-whisper` — the model
+  (`base.en` by default, set `WHISPER_MODEL` in `.env` to change it, e.g.
+  `tiny.en` for faster/less accurate or `small.en` for slower/more accurate)
+  downloads once on first use and then runs fully offline, no API key. The
+  whole app is still single-recruiter-facing per the spec ("display in the
+  recruiter dashboard") — a recruiter runs the simulation and either types
+  on the candidate's behalf or hands them the mic/keyboard for their turn.

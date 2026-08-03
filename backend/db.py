@@ -26,6 +26,8 @@ resumes = _db["resumes"]
 counters = _db["counters"]
 users = _db["users"]
 job_descriptions = _db["job_descriptions"]
+interview_sessions = _db["interview_sessions"]
+pipeline = _db["pipeline"]
 
 # Fields returned for list/search views — everything except the heavy
 # raw_text blob (mirrors the old SQLite SELECT column list).
@@ -72,6 +74,16 @@ def init_db():
     job_descriptions.create_index([("owner", ASCENDING)])
     job_descriptions.create_index([("created_at", DESCENDING)])
     counters.update_one({"_id": "job_descriptions"}, {"$setOnInsert": {"seq": 0}}, upsert=True)
+
+    interview_sessions.create_index([("id", ASCENDING)], unique=True)
+    interview_sessions.create_index([("owner", ASCENDING)])
+    interview_sessions.create_index([("resume_id", ASCENDING)])
+    counters.update_one({"_id": "interview_sessions"}, {"$setOnInsert": {"seq": 0}}, upsert=True)
+
+    pipeline.create_index([("id", ASCENDING)], unique=True)
+    pipeline.create_index([("owner", ASCENDING)])
+    pipeline.create_index([("owner", ASCENDING), ("resume_id", ASCENDING), ("job_id", ASCENDING)], unique=True)
+    counters.update_one({"_id": "pipeline"}, {"$setOnInsert": {"seq": 0}}, upsert=True)
 
 
 # ---------------------------------------------------------------------------
@@ -284,4 +296,134 @@ def get_job(owner: str, job_id: int) -> dict | None:
 
 def delete_job(owner: str, job_id: int) -> bool:
     result = job_descriptions.delete_one({"id": job_id, "owner": owner})
+    return result.deleted_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Interview sessions (question generation + simulated Q&A + evaluation)
+# ---------------------------------------------------------------------------
+
+def create_interview_session(
+    owner: str, resume_id: int, resume_name: str, job_id: int | None, job_title: str, questions: list
+) -> dict:
+    """questions: list of {id, category, difficulty, question} — category is
+    'technical' | 'behavioral' | 'follow_up'."""
+    new_id = _next_id("interview_sessions")
+    doc = {
+        "id": new_id,
+        "owner": owner,
+        "resume_id": resume_id,
+        "resume_name": resume_name,
+        "job_id": job_id,
+        "job_title": job_title,
+        "questions": questions,
+        "answers": {},       # question_id (str) -> answer text
+        "evaluations": {},   # question_id (str) -> evaluation dict
+        "status": "in_progress",  # in_progress | completed
+        "report": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    interview_sessions.insert_one(doc)
+    return _clean(doc)
+
+
+def get_interview_session(owner: str, session_id: int) -> dict | None:
+    return _clean(interview_sessions.find_one({"id": session_id, "owner": owner}))
+
+
+def list_interview_sessions(owner: str) -> list:
+    return list(
+        interview_sessions.find(
+            {"owner": owner},
+            {"_id": 0, "id": 1, "resume_name": 1, "job_title": 1, "status": 1, "created_at": 1, "report": 1},
+        ).sort("created_at", DESCENDING)
+    )
+
+
+def save_interview_answer(owner: str, session_id: int, question_id: str, answer: str, evaluation: dict) -> bool:
+    result = interview_sessions.update_one(
+        {"id": session_id, "owner": owner},
+        {"$set": {f"answers.{question_id}": answer, f"evaluations.{question_id}": evaluation}},
+    )
+    return result.matched_count > 0
+
+
+def complete_interview_session(owner: str, session_id: int, report: dict) -> bool:
+    result = interview_sessions.update_one(
+        {"id": session_id, "owner": owner},
+        {"$set": {"status": "completed", "report": report}},
+    )
+    return result.matched_count > 0
+
+
+def delete_interview_session(owner: str, session_id: int) -> bool:
+    result = interview_sessions.delete_one({"id": session_id, "owner": owner})
+    return result.deleted_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Pipeline / ATS (candidate <-> job application tracking)
+# ---------------------------------------------------------------------------
+
+PIPELINE_STAGES = ["Applied", "Screening", "Interview", "Selected", "Rejected"]
+
+
+def upsert_pipeline_entry(
+    owner: str,
+    resume_id: int,
+    resume_name: str,
+    job_id: int,
+    job_title: str,
+    status: str | None = None,
+    interview_datetime: str | None = None,
+    recruiter_feedback: str | None = None,
+) -> dict:
+    """Create or update the single pipeline entry for this candidate+job pair."""
+    existing = pipeline.find_one({"owner": owner, "resume_id": resume_id, "job_id": job_id})
+    now = datetime.now(timezone.utc).isoformat()
+
+    if existing:
+        updates = {"updated_at": now}
+        if status is not None:
+            updates["status"] = status
+        if interview_datetime is not None:
+            updates["interview_datetime"] = interview_datetime
+        if recruiter_feedback is not None:
+            updates["recruiter_feedback"] = recruiter_feedback
+        pipeline.update_one({"_id": existing["_id"]}, {"$set": updates})
+        return _clean(pipeline.find_one({"_id": existing["_id"]}))
+
+    new_id = _next_id("pipeline")
+    doc = {
+        "id": new_id,
+        "owner": owner,
+        "resume_id": resume_id,
+        "resume_name": resume_name,
+        "job_id": job_id,
+        "job_title": job_title,
+        "status": status or "Applied",
+        "interview_datetime": interview_datetime,
+        "recruiter_feedback": recruiter_feedback or "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    pipeline.insert_one(doc)
+    return _clean(doc)
+
+
+def list_pipeline(owner: str, job_id: int | None = None, status: str | None = None) -> list:
+    query: dict = {"owner": owner}
+    if job_id is not None:
+        query["job_id"] = job_id
+    if status:
+        query["status"] = status
+    return list(pipeline.find(query, {"_id": 0}).sort("updated_at", DESCENDING))
+
+
+def get_pipeline_entry(owner: str, entry_id: int) -> dict | None:
+    return _clean(pipeline.find_one({"id": entry_id, "owner": owner}))
+
+
+def delete_pipeline_entry(owner: str, entry_id: int) -> bool:
+    result = pipeline.delete_one({"id": entry_id, "owner": owner})
     return result.deleted_count > 0

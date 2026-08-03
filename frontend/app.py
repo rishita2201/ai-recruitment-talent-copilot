@@ -36,6 +36,8 @@ _DEFAULTS = {
     "match_job_title": None,
     "match_results": None,          # {"job_title", "required_skills", ..., "results": [...]}
     "match_job_choice": None,       # "adhoc" or a saved job's id
+    "interview_session": None,      # currently open interview session dict
+    "pipeline_job_filter": None,    # job_id filter for Pipeline tab, or None = all
 }
 for key, default in _DEFAULTS.items():
     st.session_state.setdefault(key, default)
@@ -187,6 +189,30 @@ st.markdown(
         background: var(--accent-soft); border: 1.5px solid #D9D2F7; border-radius: 10px;
         padding: 0.7rem 0.9rem; font-size: 0.92rem; font-weight: 600; color: var(--ink) !important;
       }
+
+      /* --- Interview & pipeline visuals --- */
+      .diff-badge {
+        display: inline-block; border-radius: 6px; padding: 0.05rem 0.55rem;
+        font-size: 0.75rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.03em;
+        margin-left: 0.5rem;
+      }
+      .diff-Beginner { background: #E6F4EC; color: var(--good) !important; }
+      .diff-Intermediate { background: #FDF1DF; color: var(--warn) !important; }
+      .diff-Advanced { background: #FBE6E5; color: var(--bad) !important; }
+
+      .stage-col-header {
+        font-size: 0.85rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.03em;
+        color: var(--ink-soft) !important; text-align: center; padding: 0.4rem 0; border-radius: 8px 8px 0 0;
+        background: var(--card-bg); border: 1.5px solid var(--border); border-bottom: none;
+      }
+      .stage-col-body {
+        border: 1.5px solid var(--border); border-radius: 0 0 8px 8px; min-height: 60px;
+        padding: 0.5rem; background: #FFFFFF;
+      }
+      .pipeline-card {
+        border: 1.5px solid var(--border); border-radius: 8px; padding: 0.5rem 0.6rem;
+        margin-bottom: 0.4rem; background: var(--card-bg); font-size: 0.85rem; font-weight: 700;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -287,6 +313,48 @@ def build_results_csv(results: list) -> str:
     for i, row in enumerate(rows, start=1):
         row["rank"] = i
     return pd.DataFrame(rows).to_csv(index=False)
+
+
+def difficulty_badge_html(difficulty: str) -> str:
+    diff = difficulty if difficulty in ("Beginner", "Intermediate", "Advanced") else "Intermediate"
+    return f'<span class="diff-badge diff-{diff}">{diff}</span>'
+
+
+def build_interview_report_md(session: dict) -> str:
+    """Markdown interview performance report — downloadable after completing
+    a simulated interview session."""
+    report = session.get("report") or {}
+    lines = [
+        f"# Interview Performance Report — {session.get('resume_name')}",
+        f"**Job:** {session.get('job_title')}",
+        "",
+        f"- **Overall Score:** {report.get('overall_score')}/100",
+        f"- **Relevance (avg):** {report.get('avg_relevance')}",
+        f"- **Communication (avg):** {report.get('avg_communication')}",
+        f"- **Confidence (avg):** {report.get('avg_confidence')}",
+        "",
+        f"**Verdict:** {report.get('verdict')}",
+        "",
+        "## Strengths",
+    ]
+    lines += [f"- {s}" for s in (report.get("strengths") or [])] or ["- None noted"]
+    lines += ["", "## Areas to improve"]
+    lines += [f"- {s}" for s in (report.get("improvements") or [])] or ["- None noted"]
+    lines += ["", "## Question-by-question detail"]
+    evaluations = session.get("evaluations") or {}
+    answers = session.get("answers") or {}
+    for q in session.get("questions") or []:
+        qid = q["id"]
+        ev = evaluations.get(qid)
+        lines.append(f"\n### [{q['category'].title()} · {q['difficulty']}] {q['question']}")
+        lines.append(f"**Answer:** {answers.get(qid, '(not answered)')}")
+        if ev:
+            lines.append(
+                f"**Scores:** relevance {ev.get('relevance_score')}, "
+                f"communication {ev.get('communication_score')}, confidence {ev.get('confidence_score')}"
+            )
+            lines.append(f"**Feedback:** {ev.get('feedback', '')}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +796,13 @@ def render_match_tab():
             default_index = job_options.index(wanted)
 
     st.markdown('<div class="section-label">Choose a job</div>', unsafe_allow_html=True)
-    choice = st.selectbox("Job", job_options, index=default_index, label_visibility="collapsed")
+    choice = st.selectbox(
+        "Job",
+        job_options,
+        index=default_index,
+        label_visibility="collapsed",
+        key="match_job_choice",
+    )
 
     using_saved_job = choice in id_by_label
     if using_saved_job:
@@ -828,6 +902,357 @@ def render_match_tab():
                     )
 
 
+def render_interview_tab():
+    token = st.session_state["token"]
+
+    st.markdown('<div class="section-label">Start a new interview prep</div>', unsafe_allow_html=True)
+
+    ok, candidates = api.list_resumes(token)
+    if not ok:
+        candidates = []
+    ok2, jobs = api.list_jobs(token)
+    if not ok2:
+        jobs = []
+
+    if not candidates:
+        st.info("Upload at least one candidate on the Candidates tab first.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        cand_labels = [f"{c.get('name') or 'Unnamed'} (#{c['id']})" for c in candidates]
+        cand_choice = st.selectbox("Candidate", cand_labels, key="interview_candidate_choice")
+        resume_id = candidates[cand_labels.index(cand_choice)]["id"]
+    with c2:
+        job_options = ["✎ Paste a one-off job description"] + [f"{j['title']} (#{j['id']})" for j in jobs]
+        id_by_label = {f"{j['title']} (#{j['id']})": j["id"] for j in jobs}
+        job_choice = st.selectbox("Job", job_options, key="interview_job_choice")
+
+    using_saved_job = job_choice in id_by_label
+    adhoc_text = ""
+    if not using_saved_job:
+        adhoc_text = st.text_area("Job description", height=140, placeholder="Paste the job description here…")
+
+    if st.button("✦ Generate interview questions", type="primary"):
+        if not using_saved_job and not adhoc_text.strip():
+            st.warning("Paste a job description, or pick a saved one.")
+        else:
+            with st.spinner("Analyzing the role and candidate profile to build interview questions…"):
+                ok3, data = api.generate_interview(
+                    token,
+                    resume_id,
+                    job_id=id_by_label.get(job_choice) if using_saved_job else None,
+                    job_description=None if using_saved_job else adhoc_text,
+                )
+            if ok3:
+                st.session_state["interview_session"] = data
+                st.rerun()
+            else:
+                st.error(data)
+
+    st.markdown('<div class="section-label">Simulated interview</div>', unsafe_allow_html=True)
+    session = st.session_state.get("interview_session")
+    if not session:
+        st.info("Generate a question set above to start a simulated interview.")
+    else:
+        render_interview_session(token, session)
+
+    st.markdown('<div class="section-label">Past interview sessions</div>', unsafe_allow_html=True)
+    ok4, sessions = api.list_interview_sessions(token)
+    if not ok4:
+        st.error(sessions)
+        sessions = []
+    if not sessions:
+        st.caption("No interview sessions yet.")
+    for s in sessions:
+        with st.container(border=True):
+            sc1, sc2, sc3 = st.columns([3, 1, 1])
+            with sc1:
+                st.markdown(f"**{s['resume_name']}** vs **{s['job_title']}**")
+                status_txt = "Completed" if s["status"] == "completed" else "In progress"
+                overall = (s.get("report") or {}).get("overall_score")
+                st.caption(f"{status_txt}" + (f" · Overall score {overall}/100" if overall is not None else ""))
+            with sc2:
+                if st.button("Open", key=f"open_session_{s['id']}", use_container_width=True):
+                    ok5, full = api.get_interview_session(token, s["id"])
+                    if ok5:
+                        st.session_state["interview_session"] = full
+                        st.rerun()
+                    else:
+                        st.error(full)
+            with sc3:
+                if st.button("Delete", key=f"del_session_{s['id']}", use_container_width=True):
+                    ok6, data = api.delete_interview_session(token, s["id"])
+                    if ok6:
+                        if st.session_state.get("interview_session", {}).get("id") == s["id"]:
+                            st.session_state["interview_session"] = None
+                        st.rerun()
+                    else:
+                        st.error(data)
+
+
+def render_interview_session(token: str, session: dict):
+    st.markdown(
+        f'<div class="meta-line">Interviewing <b>{session["resume_name"]}</b> for '
+        f'<b>{session["job_title"]}</b></div>',
+        unsafe_allow_html=True,
+    )
+
+    categories = [("technical", "Technical questions"), ("behavioral", "Behavioral questions"), ("follow_up", "Follow-up questions")]
+    for cat_key, cat_label in categories:
+        qs = [q for q in session["questions"] if q["category"] == cat_key]
+        if not qs:
+            continue
+        st.markdown(f"**{cat_label}**")
+        for q in qs:
+            qid = q["id"]
+            with st.container(border=True):
+                st.markdown(
+                    f'{q["question"]} {difficulty_badge_html(q["difficulty"])}', unsafe_allow_html=True
+                )
+                existing_answer = (session.get("answers") or {}).get(qid, "")
+
+                mode = st.radio(
+                    "Response mode", ["⌨ Type answer", "🎙 Record voice answer"],
+                    key=f"mode_{session['id']}_{qid}", horizontal=True, label_visibility="collapsed",
+                )
+
+                if mode == "⌨ Type answer":
+                    answer = st.text_area(
+                        "Candidate's answer", value=existing_answer, key=f"answer_{session['id']}_{qid}",
+                        label_visibility="collapsed", placeholder="Type the candidate's answer here…", height=90,
+                    )
+                    if st.button("Submit answer", key=f"submit_{session['id']}_{qid}"):
+                        if not answer.strip():
+                            st.warning("Enter an answer first.")
+                        else:
+                            with st.spinner("Evaluating answer…"):
+                                ok, ev = api.answer_interview_question(token, session["id"], qid, answer)
+                            if ok:
+                                session.setdefault("answers", {})[qid] = answer
+                                session.setdefault("evaluations", {})[qid] = ev
+                                st.session_state["interview_session"] = session
+                                st.rerun()
+                            else:
+                                st.error(ev)
+                else:
+                    audio_bytes = None
+                    if hasattr(st, "audio_input"):
+                        audio = st.audio_input("Record the candidate's answer", key=f"audio_{session['id']}_{qid}")
+                        if audio is not None:
+                            audio_bytes = audio.getvalue()
+                        st.caption("Transcribed locally with Whisper — no audio leaves your machine's Ollama/Whisper setup.")
+                    else:
+                        audio_file = st.file_uploader(
+                            "Upload the candidate's answer recording",
+                            type=["wav", "mp3", "m4a", "ogg"],
+                            key=f"audio_{session['id']}_{qid}",
+                        )
+                        if audio_file is not None:
+                            audio_bytes = audio_file.getvalue()
+                        st.caption("Upload a voice recording to transcribe locally with Whisper.")
+
+                    if audio_bytes is not None and st.button("Submit voice answer", key=f"submit_audio_{session['id']}_{qid}"):
+                        with st.spinner("Transcribing and evaluating the recording…"):
+                            ok, result = api.answer_interview_question_audio(
+                                token, session["id"], qid, "answer.wav", audio_bytes
+                            )
+                        if ok:
+                            transcript = result.pop("transcript", "")
+                            st.success(f'Transcript: "{transcript}"')
+                            session.setdefault("answers", {})[qid] = transcript
+                            session.setdefault("evaluations", {})[qid] = result
+                            st.session_state["interview_session"] = session
+                            st.rerun()
+                        else:
+                            st.error(result)
+                    elif existing_answer:
+                        st.caption(f'Last submitted answer: "{existing_answer}"')
+
+                ev = (session.get("evaluations") or {}).get(qid)
+                if ev:
+                    bc1, bc2, bc3 = st.columns(3)
+                    with bc1:
+                        st.markdown(gap_bar_html("Relevance", ev.get("relevance_score")), unsafe_allow_html=True)
+                    with bc2:
+                        st.markdown(gap_bar_html("Communication", ev.get("communication_score")), unsafe_allow_html=True)
+                    with bc3:
+                        st.markdown(gap_bar_html("Confidence", ev.get("confidence_score")), unsafe_allow_html=True)
+                    st.write(ev.get("feedback", ""))
+
+    answered = len(session.get("evaluations") or {})
+    total = len(session.get("questions") or [])
+    st.caption(f"{answered} of {total} questions answered.")
+
+    if session.get("status") == "completed" and session.get("report"):
+        render_interview_report(session)
+    elif st.button("✔ Complete interview & generate report", type="primary"):
+        if answered == 0:
+            st.warning("Submit at least one answer before completing the interview.")
+        else:
+            with st.spinner("Aggregating performance report…"):
+                ok, report = api.complete_interview(token, session["id"])
+            if ok:
+                session["status"] = "completed"
+                session["report"] = report
+                st.session_state["interview_session"] = session
+                st.rerun()
+            else:
+                st.error(report)
+
+
+def render_interview_report(session: dict):
+    report = session.get("report") or {}
+    st.markdown('<div class="section-label">Interview performance report</div>', unsafe_allow_html=True)
+    st.markdown(score_badge_html("Overall Score", report.get("overall_score")), unsafe_allow_html=True)
+    st.write(report.get("verdict", ""))
+
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        st.markdown(gap_bar_html("Relevance (avg)", report.get("avg_relevance")), unsafe_allow_html=True)
+    with bc2:
+        st.markdown(gap_bar_html("Communication (avg)", report.get("avg_communication")), unsafe_allow_html=True)
+    with bc3:
+        st.markdown(gap_bar_html("Confidence (avg)", report.get("avg_confidence")), unsafe_allow_html=True)
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        st.markdown("**Strengths**")
+        st.markdown(chip_row_html(report.get("strengths"), "skill-chip"), unsafe_allow_html=True)
+    with rc2:
+        st.markdown("**Areas to improve**")
+        st.markdown(chip_row_html(report.get("improvements"), "job-chip"), unsafe_allow_html=True)
+
+    st.download_button(
+        "⬇ Download interview report (Markdown)",
+        data=build_interview_report_md(session),
+        file_name=f"interview_report_{session['resume_name'].replace(' ', '_')}.md",
+        mime="text/markdown",
+        key=f"interview_report_{session['id']}",
+    )
+
+
+def render_pipeline_tab():
+    token = st.session_state["token"]
+
+    ok, jobs = api.list_jobs(token)
+    if not ok:
+        jobs = []
+    if not jobs:
+        st.info("Save a Job Description first (Job Descriptions tab) to start tracking a pipeline.")
+        return
+    job_labels = ["All jobs"] + [f"{j['title']} (#{j['id']})" for j in jobs]
+    job_id_by_label = {f"{j['title']} (#{j['id']})": j["id"] for j in jobs}
+
+    st.markdown('<div class="section-label">Candidate pipeline</div>', unsafe_allow_html=True)
+    job_filter_label = st.selectbox("Filter by job", job_labels, key="pipeline_job_filter")
+    job_filter_id = job_id_by_label.get(job_filter_label)
+
+    ok2, entries = api.list_pipeline(token, job_id=job_filter_id)
+    if not ok2:
+        st.error(entries)
+        entries = []
+
+    # Kanban-style stage overview
+    stage_cols = st.columns(len(db_stages := ["Applied", "Screening", "Interview", "Selected", "Rejected"]))
+    by_stage = {s: [] for s in db_stages}
+    for e in entries:
+        by_stage.setdefault(e["status"], []).append(e)
+    for col, stage in zip(stage_cols, db_stages):
+        with col:
+            st.markdown(f'<div class="stage-col-header">{stage} ({len(by_stage[stage])})</div>', unsafe_allow_html=True)
+            body = "".join(
+                f'<div class="pipeline-card">{e["resume_name"]}<br>'
+                f'<span class="meta-line">{e["job_title"]}</span></div>'
+                for e in by_stage[stage]
+            ) or '<div class="meta-line">—</div>'
+            st.markdown(f'<div class="stage-col-body">{body}</div>', unsafe_allow_html=True)
+
+    st.write("")
+    st.markdown('<div class="section-label">Add or update a candidate in the pipeline</div>', unsafe_allow_html=True)
+    ok3, candidates = api.list_resumes(token)
+    if not ok3:
+        candidates = []
+    if candidates:
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            cand_labels = [f"{c.get('name') or 'Unnamed'} (#{c['id']})" for c in candidates]
+            cand_choice = st.selectbox("Candidate", cand_labels, key="pipeline_cand_choice")
+            picked_resume_id = candidates[cand_labels.index(cand_choice)]["id"]
+        with cc2:
+            job_choice_2 = st.selectbox(
+                "Job", [f"{j['title']} (#{j['id']})" for j in jobs], key="pipeline_job_choice"
+            )
+            picked_job_id = job_id_by_label[job_choice_2]
+        with cc3:
+            status_choice = st.selectbox("Stage", db_stages, key="pipeline_status_choice")
+
+        interview_dt = st.text_input(
+            "Interview date/time (optional, free text)", placeholder="e.g. 2026-08-04 3:00 PM", key="pipeline_dt"
+        )
+        feedback = st.text_area("Recruiter feedback (optional)", key="pipeline_feedback", height=80)
+
+        if st.button("Save to pipeline", type="primary"):
+            ok4, data = api.upsert_pipeline(
+                token, picked_resume_id, picked_job_id, status_choice, interview_dt or None, feedback or None
+            )
+            if ok4:
+                st.success(f'{data["resume_name"]} set to "{data["status"]}" for {data["job_title"]}.')
+                st.rerun()
+            else:
+                st.error(data)
+
+    st.write("")
+    st.markdown('<div class="section-label">All pipeline entries</div>', unsafe_allow_html=True)
+    fc1, fc2 = st.columns([1, 2])
+    with fc1:
+        status_filter = st.selectbox("Filter by stage", ["All stages"] + db_stages, key="pipeline_status_filter")
+    with fc2:
+        name_query = st.text_input(
+            "Search candidate name", placeholder="Search candidate name…", key="pipeline_name_search",
+            label_visibility="collapsed",
+        )
+
+    filtered_entries = entries
+    if status_filter != "All stages":
+        filtered_entries = [e for e in filtered_entries if e["status"] == status_filter]
+    if name_query.strip():
+        q = name_query.strip().lower()
+        filtered_entries = [e for e in filtered_entries if q in e["resume_name"].lower()]
+
+    if not filtered_entries:
+        st.caption("No pipeline entries match this filter.")
+    for e in filtered_entries:
+        with st.container(border=True):
+            ec1, ec2 = st.columns([3, 2])
+            with ec1:
+                st.markdown(f"**{e['resume_name']}** — {e['job_title']}")
+                if e.get("interview_datetime"):
+                    st.caption(f"Interview: {e['interview_datetime']}")
+                if e.get("recruiter_feedback"):
+                    st.write(e["recruiter_feedback"])
+            with ec2:
+                new_status = st.selectbox(
+                    "Stage", db_stages, index=db_stages.index(e["status"]), key=f"stage_{e['id']}",
+                    label_visibility="collapsed",
+                )
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    if st.button("Update stage", key=f"update_stage_{e['id']}", use_container_width=True):
+                        ok5, data = api.update_pipeline(token, e["id"], status=new_status)
+                        if ok5:
+                            st.rerun()
+                        else:
+                            st.error(data)
+                with bc2:
+                    if st.button("Remove", key=f"remove_pipeline_{e['id']}", use_container_width=True):
+                        ok6, data = api.delete_pipeline(token, e["id"])
+                        if ok6:
+                            st.rerun()
+                        else:
+                            st.error(data)
+
+
 def render_dashboard_tab():
     token = st.session_state["token"]
     ok, stats = api.get_stats(token)
@@ -860,11 +1285,51 @@ def render_dashboard_tab():
         else:
             st.info("No education data yet.")
 
+    st.write("")
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown('<div class="section-label">Candidate pipeline</div>', unsafe_allow_html=True)
+        okp, entries = api.list_pipeline(token)
+        if not okp:
+            st.error(entries)
+            entries = []
+        stages = ["Applied", "Screening", "Interview", "Selected", "Rejected"]
+        counts = {s: 0 for s in stages}
+        for e in entries:
+            counts[e["status"]] = counts.get(e["status"], 0) + 1
+        if entries:
+            df = pd.DataFrame({"stage": stages, "count": [counts[s] for s in stages]}).set_index("stage")
+            st.bar_chart(df, use_container_width=True)
+        else:
+            st.info("No candidates in the pipeline yet — add some on the Pipeline tab.")
+
+    with col4:
+        st.markdown('<div class="section-label">Interview activity</div>', unsafe_allow_html=True)
+        oki, sessions = api.list_interview_sessions(token)
+        if not oki:
+            st.error(sessions)
+            sessions = []
+        completed = [s for s in sessions if s.get("status") == "completed"]
+        if sessions:
+            scores = [s["report"]["overall_score"] for s in completed if s.get("report")]
+            avg_score = round(sum(scores) / len(scores), 1) if scores else None
+            ic1, ic2 = st.columns(2)
+            ic1.metric("Interviews run", len(sessions))
+            ic2.metric("Avg. performance score", avg_score if avg_score is not None else "—")
+            st.caption("Most recent sessions:")
+            for s in sessions[:5]:
+                score_txt = f' · {s["report"]["overall_score"]}/100' if s.get("report") else " · in progress"
+                st.markdown(f'<div class="meta-line">{s["resume_name"]} vs {s["job_title"]}{score_txt}</div>', unsafe_allow_html=True)
+        else:
+            st.info("No interview sessions yet — generate one on the Interview Prep tab.")
+
 
 def render_app():
     render_topbar()
     st.write("")
-    tab1, tab2, tab3, tab4 = st.tabs(["Candidates", "Job Descriptions", "Match Job", "Dashboard"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Candidates", "Job Descriptions", "Match Job", "Interview Prep", "Pipeline", "Dashboard"]
+    )
     with tab1:
         render_candidates_tab()
     with tab2:
@@ -872,6 +1337,10 @@ def render_app():
     with tab3:
         render_match_tab()
     with tab4:
+        render_interview_tab()
+    with tab5:
+        render_pipeline_tab()
+    with tab6:
         render_dashboard_tab()
 
 

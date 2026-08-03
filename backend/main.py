@@ -12,7 +12,7 @@ import re
 import secrets
 
 import bcrypt
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Query
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, field_validator
 from pymongo.errors import DuplicateKeyError
@@ -65,6 +65,50 @@ class JobDescriptionCreate(BaseModel):
 
 class NotesRequest(BaseModel):
     notes: str
+
+
+class InterviewGenerateRequest(BaseModel):
+    resume_id: int
+    job_id: int | None = None
+    job_description: str | None = None
+
+    @field_validator("job_description")
+    @classmethod
+    def optional_text(cls, v):
+        return v
+
+
+class InterviewAnswerRequest(BaseModel):
+    question_id: str
+    answer: str
+
+
+class PipelineUpsertRequest(BaseModel):
+    resume_id: int
+    job_id: int
+    status: str | None = None
+    interview_datetime: str | None = None
+    recruiter_feedback: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def valid_status(cls, v):
+        if v is not None and v not in db.PIPELINE_STAGES:
+            raise ValueError(f"status must be one of {db.PIPELINE_STAGES}")
+        return v
+
+
+class PipelineUpdateRequest(BaseModel):
+    status: str | None = None
+    interview_datetime: str | None = None
+    recruiter_feedback: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def valid_status(cls, v):
+        if v is not None and v not in db.PIPELINE_STAGES:
+            raise ValueError(f"status must be one of {db.PIPELINE_STAGES}")
+        return v
 
 
 class SignupRequest(BaseModel):
@@ -271,38 +315,52 @@ def delete_job(job_id: int, user: dict = Depends(get_current_user)):
     return {"deleted": job_id}
 
 
+def _resolve_job(user: dict, job_id: int | None, job_description: str | None) -> dict:
+    """Resolve a job's concrete requirements — either from a saved Job
+    Description, or by extracting them on the fly from ad-hoc pasted text —
+    so matching and interview generation always have required_skills /
+    min_years / required_education to work with. Shared by /match and
+    /interview/generate."""
+    if not job_id and not (job_description and job_description.strip()):
+        raise HTTPException(400, "Provide either job_id or job_description.")
+
+    if job_id:
+        job = db.get_job(user["username"], job_id)
+        if not job:
+            raise HTTPException(404, "Job description not found.")
+        return {
+            "job_title": job["title"],
+            "job_text": job["raw_text"],
+            "required_skills": job.get("required_skills") or [],
+            "min_years_experience": job.get("min_years_experience"),
+            "required_education": job.get("required_education"),
+        }
+
+    try:
+        extracted = parser.extract_job_requirements(job_description)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {
+        "job_title": extracted.get("title") or "Ad-hoc job description",
+        "job_text": job_description,
+        "required_skills": extracted.get("required_skills") or [],
+        "min_years_experience": extracted.get("min_years_experience"),
+        "required_education": extracted.get("required_education"),
+    }
+
+
 @app.post("/match")
 def match_candidates(req: MatchRequest, user: dict = Depends(get_current_user)):
     """Score one candidate (resume_id set) or every candidate (resume_id omitted)
     against a job — either a saved Job Description (job_id) or ad-hoc pasted
     text (job_description). Returns a full skill-gap breakdown and a weighted
     Hiring Score per candidate, ranked descending."""
-    if not req.job_id and not (req.job_description and req.job_description.strip()):
-        raise HTTPException(400, "Provide either job_id or job_description.")
-
-    # Resolve the job's concrete requirements — either from a saved Job
-    # Description, or by extracting them on the fly from pasted text so we
-    # always have required_skills / min_years / required_education to score against.
-    if req.job_id:
-        job = db.get_job(user["username"], req.job_id)
-        if not job:
-            raise HTTPException(404, "Job description not found.")
-        job_title = job["title"]
-        job_text = job["raw_text"]
-        required_skills = job.get("required_skills") or []
-        min_years_experience = job.get("min_years_experience")
-        required_education = job.get("required_education")
-    else:
-        job_text = req.job_description
-        job_title = "Ad-hoc job description"
-        try:
-            extracted = parser.extract_job_requirements(job_text)
-        except RuntimeError as e:
-            raise HTTPException(502, str(e))
-        job_title = extracted.get("title") or job_title
-        required_skills = extracted.get("required_skills") or []
-        min_years_experience = extracted.get("min_years_experience")
-        required_education = extracted.get("required_education")
+    job = _resolve_job(user, req.job_id, req.job_description)
+    job_title = job["job_title"]
+    job_text = job["job_text"]
+    required_skills = job["required_skills"]
+    min_years_experience = job["min_years_experience"]
+    required_education = job["required_education"]
 
     if req.resume_id is not None:
         profiles = db.get_resumes_for_matching(user["username"])
@@ -360,3 +418,200 @@ def match_candidates(req: MatchRequest, user: dict = Depends(get_current_user)):
         "required_education": required_education,
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# AI Interview & Candidate Management
+#   Module 1: role-specific interview question generation
+#   Module 3: AI-powered interview simulation (answer + evaluate + report)
+# ---------------------------------------------------------------------------
+
+def _get_profile_for_matching(user: dict, resume_id: int) -> dict:
+    profiles = db.get_resumes_for_matching(user["username"])
+    profile = next((p for p in profiles if p["id"] == resume_id), None)
+    if not profile:
+        raise HTTPException(404, "Resume not found.")
+    return profile
+
+
+@app.post("/interview/generate")
+def generate_interview(req: InterviewGenerateRequest, user: dict = Depends(get_current_user)):
+    """Module 1: retrieve the selected job + candidate resume, analyze the
+    job's required skills/responsibilities against the candidate's profile,
+    and generate a role-specific + candidate-specific interview question set
+    (technical, behavioral, and resume-targeted follow-ups), each tagged with
+    a difficulty level. Creates a new interview session recruiters can then
+    run as a simulated interview (Module 3)."""
+    profile = _get_profile_for_matching(user, req.resume_id)
+    job = _resolve_job(user, req.job_id, req.job_description)
+
+    try:
+        generated = parser.generate_interview_questions(profile, job["job_text"])
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+    questions = []
+    qid = 1
+    for q in generated.get("technical_questions") or []:
+        questions.append({"id": str(qid), "category": "technical", "difficulty": q.get("difficulty", "Intermediate"), "question": q.get("question", "")})
+        qid += 1
+    for q in generated.get("behavioral_questions") or []:
+        questions.append({"id": str(qid), "category": "behavioral", "difficulty": q.get("difficulty", "Intermediate"), "question": q.get("question", "")})
+        qid += 1
+    for q in generated.get("follow_up_questions") or []:
+        text = q if isinstance(q, str) else q.get("question", "")
+        questions.append({"id": str(qid), "category": "follow_up", "difficulty": "Intermediate", "question": text})
+        qid += 1
+
+    session = db.create_interview_session(
+        user["username"], profile["id"], profile.get("name") or "Unnamed candidate",
+        req.job_id, job["job_title"], questions,
+    )
+    return session
+
+
+@app.get("/interview/sessions")
+def list_interview_sessions(user: dict = Depends(get_current_user)):
+    return db.list_interview_sessions(user["username"])
+
+
+@app.get("/interview/sessions/{session_id}")
+def get_interview_session(session_id: int, user: dict = Depends(get_current_user)):
+    session = db.get_interview_session(user["username"], session_id)
+    if not session:
+        raise HTTPException(404, "Interview session not found.")
+    return session
+
+
+def _evaluate_and_save_answer(user: dict, session_id: int, question_id: str, answer_text: str) -> dict:
+    session = db.get_interview_session(user["username"], session_id)
+    if not session:
+        raise HTTPException(404, "Interview session not found.")
+
+    question = next((q for q in session["questions"] if q["id"] == question_id), None)
+    if not question:
+        raise HTTPException(404, "Question not found in this session.")
+
+    try:
+        evaluation = parser.evaluate_interview_answer(
+            question["question"], question["difficulty"], question["category"], answer_text
+        )
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+    db.save_interview_answer(user["username"], session_id, question_id, answer_text, evaluation)
+    return evaluation
+
+
+@app.post("/interview/sessions/{session_id}/answer")
+def answer_interview_question(session_id: int, req: InterviewAnswerRequest, user: dict = Depends(get_current_user)):
+    """Module 3: accept a candidate's text answer to one question, evaluate
+    it with AI for relevance, communication, and confidence, and return the
+    evaluation immediately (so a recruiter running the simulation gets
+    live feedback question-by-question)."""
+    return _evaluate_and_save_answer(user, session_id, req.question_id, req.answer)
+
+
+@app.post("/interview/sessions/{session_id}/answer-audio")
+async def answer_interview_question_audio(
+    session_id: int,
+    question_id: str = Form(...),
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    """Module 3: accept a candidate's recorded/uploaded VOICE answer. The
+    audio is transcribed locally (free, no API key) with faster-whisper,
+    then scored through the exact same evaluation pipeline as a typed
+    answer. Returns both the transcript and the evaluation."""
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(400, "Empty audio file.")
+    try:
+        transcript = parser.transcribe_audio(audio_bytes, file.filename or "answer.wav")
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    if not transcript.strip():
+        raise HTTPException(422, "Couldn't detect any speech in that recording — try again.")
+
+    evaluation = _evaluate_and_save_answer(user, session_id, question_id, transcript)
+    return {"transcript": transcript, **evaluation}
+
+
+@app.post("/interview/sessions/{session_id}/complete")
+def complete_interview(session_id: int, user: dict = Depends(get_current_user)):
+    """Aggregate every answered question's evaluation into one interview
+    performance report — overall score, per-dimension averages, a plain-
+    language verdict, and pooled strengths/improvements — and mark the
+    session completed so it shows up summarized in the recruiter dashboard."""
+    session = db.get_interview_session(user["username"], session_id)
+    if not session:
+        raise HTTPException(404, "Interview session not found.")
+
+    evaluations = list(session.get("evaluations", {}).values())
+    report = scoring.summarize_interview(evaluations)
+    db.complete_interview_session(user["username"], session_id, report)
+    return report
+
+
+@app.delete("/interview/sessions/{session_id}")
+def delete_interview_session(session_id: int, user: dict = Depends(get_current_user)):
+    if not db.delete_interview_session(user["username"], session_id):
+        raise HTTPException(404, "Interview session not found.")
+    return {"deleted": session_id}
+
+
+# ---------------------------------------------------------------------------
+# AI Interview & Candidate Management
+#   Module 2: ATS integration — candidate pipeline / stage tracking
+# ---------------------------------------------------------------------------
+
+@app.post("/pipeline")
+def upsert_pipeline(req: PipelineUpsertRequest, user: dict = Depends(get_current_user)):
+    """Synchronize a shortlisted candidate into the recruitment pipeline for
+    a job (creating the entry on first call, updating it on later calls) —
+    tracking stage, interview schedule, and recruiter feedback."""
+    resume = db.get_resume(user["username"], req.resume_id)
+    if not resume:
+        raise HTTPException(404, "Resume not found.")
+    job = db.get_job(user["username"], req.job_id)
+    if not job:
+        raise HTTPException(404, "Job description not found.")
+
+    return db.upsert_pipeline_entry(
+        user["username"], req.resume_id, resume.get("name") or "Unnamed candidate",
+        req.job_id, job["title"], req.status, req.interview_datetime, req.recruiter_feedback,
+    )
+
+
+@app.get("/pipeline")
+def list_pipeline(
+    job_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
+    user: dict = Depends(get_current_user),
+):
+    """List pipeline entries, optionally filtered by job and/or stage —
+    powers the recruiter dashboard's candidate pipeline view and search/filtering."""
+    return db.list_pipeline(user["username"], job_id, status)
+
+
+@app.patch("/pipeline/{entry_id}")
+def update_pipeline(entry_id: int, req: PipelineUpdateRequest, user: dict = Depends(get_current_user)):
+    entry = db.get_pipeline_entry(user["username"], entry_id)
+    if not entry:
+        raise HTTPException(404, "Pipeline entry not found.")
+    return db.upsert_pipeline_entry(
+        user["username"], entry["resume_id"], entry["resume_name"], entry["job_id"], entry["job_title"],
+        req.status, req.interview_datetime, req.recruiter_feedback,
+    )
+
+
+@app.delete("/pipeline/{entry_id}")
+def delete_pipeline(entry_id: int, user: dict = Depends(get_current_user)):
+    if not db.delete_pipeline_entry(user["username"], entry_id):
+        raise HTTPException(404, "Pipeline entry not found.")
+    return {"deleted": entry_id}
+
+
+@app.get("/pipeline/stages")
+def pipeline_stages():
+    return {"stages": db.PIPELINE_STAGES}

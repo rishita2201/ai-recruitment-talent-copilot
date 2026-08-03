@@ -140,3 +140,92 @@ def get_job(token: str, job_id: int):
 
 def delete_job(token: str, job_id: int):
     return _call("DELETE", f"/jobs/{job_id}", token=token)
+
+
+# ---------------------------------------------------------------------------
+# Interview generation & simulation
+# ---------------------------------------------------------------------------
+
+def generate_interview(token: str, resume_id: int, job_id: int | None = None, job_description: str | None = None):
+    payload = {"resume_id": resume_id, "job_id": job_id, "job_description": job_description}
+    return _call("POST", "/interview/generate", token=token, json=payload, timeout=AI_TIMEOUT)
+
+
+def list_interview_sessions(token: str):
+    return _call("GET", "/interview/sessions", token=token)
+
+
+def get_interview_session(token: str, session_id: int):
+    return _call("GET", f"/interview/sessions/{session_id}", token=token)
+
+
+def answer_interview_question(token: str, session_id: int, question_id: str, answer: str):
+    payload = {"question_id": question_id, "answer": answer}
+    return _call("POST", f"/interview/sessions/{session_id}/answer", token=token, json=payload, timeout=AI_TIMEOUT)
+
+
+def answer_interview_question_audio(token: str, session_id: int, question_id: str, filename: str, audio_bytes: bytes):
+    files = {"file": (filename, audio_bytes)}
+    data = {"question_id": question_id}
+    return _call(
+        "POST", f"/interview/sessions/{session_id}/answer-audio", token=token,
+        files=files, data=data, timeout=AI_TIMEOUT,
+    )
+
+
+def complete_interview(token: str, session_id: int):
+    return _call("POST", f"/interview/sessions/{session_id}/complete", token=token, timeout=AI_TIMEOUT)
+
+
+def delete_interview_session(token: str, session_id: int):
+    return _call("DELETE", f"/interview/sessions/{session_id}", token=token)
+
+
+# ---------------------------------------------------------------------------
+# ATS pipeline
+# ---------------------------------------------------------------------------
+
+def upsert_pipeline(
+    token: str,
+    resume_id: int,
+    job_id: int,
+    status: str | None = None,
+    interview_datetime: str | None = None,
+    recruiter_feedback: str | None = None,
+):
+    payload = {
+        "resume_id": resume_id,
+        "job_id": job_id,
+        "status": status,
+        "interview_datetime": interview_datetime,
+        "recruiter_feedback": recruiter_feedback,
+    }
+    return _call("POST", "/pipeline", token=token, json=payload)
+
+
+def list_pipeline(token: str, job_id: int | None = None, status: str | None = None):
+    params = {}
+    if job_id is not None:
+        params["job_id"] = job_id
+    if status:
+        params["status"] = status
+    return _call("GET", "/pipeline", token=token, params=params or None)
+
+
+def update_pipeline(
+    token: str,
+    entry_id: int,
+    status: str | None = None,
+    interview_datetime: str | None = None,
+    recruiter_feedback: str | None = None,
+):
+    payload = {"status": status, "interview_datetime": interview_datetime, "recruiter_feedback": recruiter_feedback}
+    return _call("PATCH", f"/pipeline/{entry_id}", token=token, json=payload)
+
+
+def delete_pipeline(token: str, entry_id: int):
+    return _call("DELETE", f"/pipeline/{entry_id}", token=token)
+
+
+def pipeline_stages(token: str):
+    return _call("GET", "/pipeline/stages", token=token)

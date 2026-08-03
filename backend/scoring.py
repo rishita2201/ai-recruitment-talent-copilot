@@ -134,3 +134,66 @@ def hiring_score(
     total_weight = sum(weight for _, weight in available)
     score = sum(val * weight for val, weight in available) / total_weight
     return round(score, 1)
+
+
+def summarize_interview(evaluations: list) -> dict:
+    """Aggregate per-question evaluations (each with relevance_score,
+    communication_score, confidence_score) into an overall interview
+    performance report: average scores per dimension, one overall score,
+    a plain-language verdict, and the pooled strengths/improvements."""
+    if not evaluations:
+        return {
+            "overall_score": 0.0,
+            "avg_relevance": None,
+            "avg_communication": None,
+            "avg_confidence": None,
+            "verdict": "No answers were submitted.",
+            "strengths": [],
+            "improvements": [],
+        }
+
+    def _avg(key):
+        vals = [e.get(key) for e in evaluations if e.get(key) is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    avg_relevance = _avg("relevance_score")
+    avg_communication = _avg("communication_score")
+    avg_confidence = _avg("confidence_score")
+
+    dims = [v for v in (avg_relevance, avg_communication, avg_confidence) if v is not None]
+    overall = round(sum(dims) / len(dims), 1) if dims else 0.0
+
+    if overall >= 80:
+        verdict = "Strong performance — clear, relevant, and confident across most answers."
+    elif overall >= 60:
+        verdict = "Solid performance with some gaps — worth a follow-up round."
+    elif overall >= 40:
+        verdict = "Mixed performance — notable gaps in relevance or communication."
+    else:
+        verdict = "Weak performance — significant gaps across most answers."
+
+    strengths, improvements = [], []
+    for e in evaluations:
+        strengths.extend(e.get("strengths") or [])
+        improvements.extend(e.get("improvements") or [])
+
+    def _dedupe(items, limit=6):
+        seen, out = set(), []
+        for item in items:
+            key = item.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(item)
+            if len(out) >= limit:
+                break
+        return out
+
+    return {
+        "overall_score": overall,
+        "avg_relevance": avg_relevance,
+        "avg_communication": avg_communication,
+        "avg_confidence": avg_confidence,
+        "verdict": verdict,
+        "strengths": _dedupe(strengths),
+        "improvements": _dedupe(improvements),
+    }

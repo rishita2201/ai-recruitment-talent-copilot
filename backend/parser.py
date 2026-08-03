@@ -13,6 +13,7 @@ sure `ollama serve` is running before starting this backend.
 import io
 import json
 import os
+import tempfile
 
 import ollama
 from pypdf import PdfReader
@@ -20,8 +21,10 @@ from docx import Document
 
 MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 
 _client: ollama.Client | None = None
+_whisper_model = None  # lazy-loaded — only needed if voice answers are used
 
 
 def get_client() -> ollama.Client:
@@ -33,6 +36,37 @@ def get_client() -> ollama.Client:
         # error instead of hanging forever.
         _client = ollama.Client(host=OLLAMA_HOST, timeout=180)
     return _client
+
+
+def _get_whisper_model():
+    """Lazily load a local, free Whisper model (faster-whisper — CPU-friendly,
+    no API key, no internet after the first download) for transcribing
+    voice interview answers. Only imported/loaded on first actual use so
+    text-only users never pay the download/startup cost."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+
+        _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def transcribe_audio(audio_bytes: bytes, filename: str = "answer.wav") -> str:
+    """Transcribe a candidate's recorded/uploaded voice answer to text using
+    a local Whisper model, so it can be scored through the same evaluation
+    pipeline as a typed answer."""
+    suffix = os.path.splitext(filename)[-1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        try:
+            model = _get_whisper_model()
+            segments, _info = model.transcribe(tmp.name, beam_size=1)
+            return " ".join(seg.text.strip() for seg in segments).strip()
+        except Exception as e:
+            raise RuntimeError(
+                f"Couldn't transcribe the audio locally (Whisper model '{WHISPER_MODEL}'): {e}"
+            )
 
 
 def extract_text(filename: str, file_bytes: bytes) -> str:
@@ -205,4 +239,97 @@ def extract_job_requirements(job_text: str) -> dict:
     of just free text."""
     trimmed = job_text[:8000]
     prompt = JOB_REQUIREMENTS_PROMPT.replace("{job_text}", trimmed)
+    return _chat_json(prompt)
+
+
+INTERVIEW_QUESTIONS_PROMPT = """You are a senior technical recruiter preparing an interview for a \
+specific candidate and a specific job. Read the candidate profile and job description below, then \
+generate an interview question set as JSON only — no preamble, no markdown fences, no commentary.
+
+Return an object with exactly these keys:
+{
+  "technical_questions": array of 3-5 objects: {"question": string, "difficulty": "Beginner" | "Intermediate" | "Advanced"}
+    — technical questions grounded in the job's required skills/responsibilities, testing whether this
+    specific candidate's background covers them,
+  "behavioral_questions": array of 2-3 objects: {"question": string, "difficulty": "Beginner" | "Intermediate" | "Advanced"}
+    — behavioral/situational questions relevant to this role,
+  "follow_up_questions": array of 2-3 strings — short follow-up questions targeting gaps or notable
+    claims in this specific candidate's resume (e.g. "You list X — can you describe a project where you used it?")
+}
+
+Base every question on the actual job requirements and the actual candidate profile below — do not
+generate generic filler questions.
+
+Candidate profile:
+Name: {name}
+Years of experience: {years_exp}
+Summary: {summary}
+Skills: {skills}
+Experience: {experience}
+
+Job description:
+---
+{job_description}
+---
+"""
+
+
+def generate_interview_questions(profile: dict, job_description: str) -> dict:
+    """Generate a role-specific + candidate-specific interview question set:
+    technical questions, behavioral questions, and resume-targeted follow-ups,
+    each technical/behavioral question tagged with a difficulty level."""
+    prompt = (
+        INTERVIEW_QUESTIONS_PROMPT.replace("{name}", str(profile.get("name") or "Unknown"))
+        .replace("{years_exp}", str(profile.get("years_exp") or "unknown"))
+        .replace("{summary}", str(profile.get("summary") or "none provided"))
+        .replace("{skills}", ", ".join(profile.get("skills") or []) or "none listed")
+        .replace(
+            "{experience}",
+            "; ".join(
+                f"{e.get('title', '')} at {e.get('company', '')}"
+                for e in (profile.get("experience") or [])
+            )
+            or "none listed",
+        )
+        .replace("{job_description}", job_description[:6000])
+    )
+    return _chat_json(prompt)
+
+
+INTERVIEW_ANSWER_EVAL_PROMPT = """You are an experienced interviewer evaluating a candidate's spoken \
+or written answer to an interview question, during a simulated mock interview. Return JSON only — no \
+preamble, no markdown fences, no commentary.
+
+Return an object with exactly these keys:
+{
+  "relevance_score": integer 0-100 (how well the answer actually addresses the question and shows
+    correct/relevant technical or situational understanding),
+  "communication_score": integer 0-100 (clarity, structure, and conciseness of the answer as written),
+  "confidence_score": integer 0-100 (how confident and decisive the answer reads — hedging, vagueness,
+    and filler reduce this; concrete specifics and ownership language raise it),
+  "feedback": string (2-3 sentences of direct, constructive feedback on this specific answer),
+  "strengths": array of 1-3 short strings (what the candidate did well in this answer),
+  "improvements": array of 1-3 short strings (concrete suggestions to improve this answer)
+}
+
+If the answer is empty, off-topic, or a placeholder like "idk", score all three metrics low and say so
+plainly in the feedback rather than being generous.
+
+Interview question ({difficulty} difficulty, {category}):
+"{question}"
+
+Candidate's answer:
+"{answer}"
+"""
+
+
+def evaluate_interview_answer(question: str, difficulty: str, category: str, answer: str) -> dict:
+    """Score one simulated-interview answer for relevance, communication, and
+    confidence, plus qualitative feedback/strengths/improvements."""
+    prompt = (
+        INTERVIEW_ANSWER_EVAL_PROMPT.replace("{question}", question)
+        .replace("{difficulty}", difficulty or "Intermediate")
+        .replace("{category}", category or "technical")
+        .replace("{answer}", (answer or "").strip() or "(no answer provided)")
+    )
     return _chat_json(prompt)
